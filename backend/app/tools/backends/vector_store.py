@@ -238,14 +238,27 @@ class FAISSVectorStore(VectorStoreBackend):
 class MilvusVectorStore(VectorStoreBackend):
     """Milvus vector database backend.
 
+    Supports two modes:
+    - Local: docker run milvusdb/milvus (host + port)
+    - Cloud: Zilliz Cloud (uri + token)
+
     Requires: pip install pymilvus
-    Docker: docker run -d -p 19530:19530 -p 9091:9091 milvusdb/milvus:latest
     """
 
-    def __init__(self, host: str = "localhost", port: int = 19530, dim: int = 768) -> None:
+    def __init__(
+        self,
+        host: str = "localhost",
+        port: int = 19530,
+        uri: str | None = None,
+        token: str | None = None,
+        dim: int = 768,
+    ) -> None:
         self.host = host
         self.port = port
+        self.uri = uri
+        self.token = token
         self.dim = dim
+        self._is_cloud = bool(uri)
         self._collection_name = "deep_research_kb"
         self._collection = None
         self._documents: list[dict] = []
@@ -256,7 +269,19 @@ class MilvusVectorStore(VectorStoreBackend):
         try:
             from pymilvus import Collection, CollectionSchema, DataType, FieldSchema, connections
 
-            connections.connect(host=self.host, port=str(self.port))
+            if self._is_cloud:
+                # Zilliz Cloud: URI + token
+                connections.connect(
+                    alias="default",
+                    uri=self.uri,
+                    token=self.token,
+                    secure=True,
+                )
+                logger.info(f"[Milvus] Connected to Zilliz Cloud: {self.uri}")
+            else:
+                # Local Milvus
+                connections.connect(host=self.host, port=str(self.port))
+                logger.info(f"[Milvus] Connected to {self.host}:{self.port}")
 
             fields = [
                 FieldSchema(name="id", dtype=DataType.INT64, is_primary=True, auto_id=True),
@@ -273,20 +298,26 @@ class MilvusVectorStore(VectorStoreBackend):
 
             # Create index if not exists
             try:
-                self._collection.create_index(
-                    field_name="embedding",
-                    index_params={"metric_type": "IP", "index_type": "IVF_FLAT", "params": {"nlist": 128}},
-                )
+                if self._is_cloud:
+                    # Zilliz Cloud serverless uses AUTOINDEX
+                    self._collection.create_index(
+                        field_name="embedding",
+                        index_params={"metric_type": "IP", "index_type": "AUTOINDEX"},
+                    )
+                else:
+                    self._collection.create_index(
+                        field_name="embedding",
+                        index_params={"metric_type": "IP", "index_type": "IVF_FLAT", "params": {"nlist": 128}},
+                    )
             except Exception:
                 pass  # Index may already exist
 
             self._collection.load()
-            logger.info(f"[Milvus] Connected to {self.host}:{self.port}, collection='{self._collection_name}'")
 
         except ImportError:
             raise ImportError("pymilvus not installed. Run: pip install pymilvus")
         except Exception as e:
-            raise RuntimeError(f"Milvus connection failed: {e}. Is Milvus running? docker run -d -p 19530:19530 milvusdb/milvus:latest")
+            raise RuntimeError(f"Milvus connection failed: {e}.")
 
     def _embed_text(self, text: str) -> list[float]:
         """Simple hash-based embedding (same as FAISS)."""
@@ -561,6 +592,18 @@ def create_vector_store_backend() -> VectorStoreBackend:
     store_type = settings.VECTOR_STORE_TYPE.lower()
 
     if store_type == "milvus":
+        # Check for Zilliz Cloud URI first
+        milvus_uri = os.getenv("MILVUS_URI", "")
+        milvus_token = os.getenv("MILVUS_TOKEN", "")
+        if milvus_uri and milvus_token:
+            try:
+                logger.info(f"[VectorStore] Using Zilliz Cloud: {milvus_uri}")
+                return MilvusVectorStore(uri=milvus_uri, token=milvus_token)
+            except Exception as e:
+                logger.warning(f"[VectorStore] Zilliz Cloud unavailable ({e}), falling back to FAISS")
+                return FAISSVectorStore()
+
+        # Local Milvus
         host = os.getenv("MILVUS_HOST", "localhost")
         port = int(os.getenv("MILVUS_PORT", "19530"))
         try:
