@@ -1,0 +1,9 @@
+.env
+prompt.md
+*.pyc
+__pycache__/
+node_modules/
+backend/logs/
+backend/data/exports/
+backend/data/*.db
+.claude/
